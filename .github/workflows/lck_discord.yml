@@ -1,0 +1,182 @@
+name: LCK 수집 및 Discord 알림
+
+# ============================================================
+# 처음에는 수동 실행(기존 JSON 전송)만 활성화합니다.
+# 아래 schedule 주석은 "매일 오전 9시 KST" 예시입니다.
+# Liquipedia 이용정책/사용 권한이 확인되기 전에는 해제하지 마세요.
+#   KST 09:00 = UTC 00:00 이므로 cron은 '0 0 * * *' 입니다.
+#
+# 활성화 방법은 README.md의 "자동 실행 활성화 조건과 방법"을 참고하세요.
+# ============================================================
+
+"on":
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "실행 모드 (notify-only: 기존 JSON 전송 / collect-and-notify: 신규 수집 후 전송)"
+        required: true
+        default: notify-only
+        type: choice
+        options:
+          - notify-only
+          - collect-and-notify
+      force_notify:
+        description: "같은 JSON이어도 알림 다시 보내기 (중복 방지 건너뜀)"
+        required: false
+        default: false
+        type: boolean
+
+  # 자동 실행 예시 (초기에는 주석 유지)
+  # schedule:
+  #   - cron: '0 0 * * *'   # 매일 오전 9시 KST
+
+permissions:
+  contents: read
+
+# 같은 워크플로가 동시에 두 번 실행되지 않도록 한다.
+# cancel-in-progress: false -> 진행 중인 실행을 취소하지 않고 새 실행을 대기시킨다.
+concurrency:
+  group: lck-discord-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  lck-discord:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: 저장소 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 3.12 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 의존성 설치 (requirements.txt)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: 실행 모드 및 활성화 정책 확인
+        id: guard
+        env:
+          INPUT_MODE: ${{ github.event.inputs.mode }}
+          ENABLE_COLLECTION: ${{ vars.ENABLE_LCK_COLLECTION }}
+        run: |
+          set -euo pipefail
+          MODE="$INPUT_MODE"
+          if [ -z "$MODE" ]; then
+            # 수동 입력이 없는 스케줄 실행은 신규 수집 모드로 간주한다.
+            MODE="collect-and-notify"
+          fi
+          echo "실행 모드: $MODE"
+
+          if [ "$MODE" = "collect-and-notify" ] && [ "$ENABLE_COLLECTION" != "true" ]; then
+            echo "::error::신규 데이터 수집이 아직 비활성화되어 있습니다. 저장소 Variables에 ENABLE_LCK_COLLECTION=true를 설정한 뒤 다시 실행하세요."
+            exit 1
+          fi
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+
+      - name: 수집 시작 시각 기록
+        if: steps.guard.outputs.mode == 'collect-and-notify'
+        run: echo "START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: LCK 데이터 수집
+        if: steps.guard.outputs.mode == 'collect-and-notify'
+        run: python lck_collector.py
+
+      - name: 수집 결과 신선도 확인
+        if: steps.guard.outputs.mode == 'collect-and-notify'
+        run: |
+          set -euo pipefail
+          FILE_EPOCH=$(stat -c %Y lck_match_results.json)
+          if [ "$FILE_EPOCH" -lt "$START_EPOCH" ]; then
+            echo "::error::수집이 실패해 JSON이 갱신되지 않았습니다. 오래된 데이터를 새로운 결과처럼 전송하지 않고 중단합니다."
+            exit 1
+          fi
+          echo "수집 결과가 이번 실행에서 갱신되었습니다."
+
+      - name: 사용할 JSON 확인
+        run: |
+          set -euo pipefail
+          test -f lck_match_results.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          data = json.loads(Path('lck_match_results.json').read_text(encoding='utf-8'))
+          print(f"사용할 JSON: 경기 {len(data.get('경기결과', []))}건 / 대회 {data.get('대회', {}).get('이름', '정보 없음')}")
+          PY
+
+      - name: 데이터 해시 계산
+        id: datahash
+        run: |
+          set -euo pipefail
+          HASH=$(sha256sum lck_match_results.json | cut -d' ' -f1)
+          echo "hash=$HASH" >> "$GITHUB_OUTPUT"
+          echo "데이터 해시 앞 12자리: ${HASH:0:12} (전체 값은 로그에 출력하지 않습니다)"
+
+      - name: 이전 전송 해시 복원
+        id: dedupe-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .lck_last_sent_hash
+          key: lck-discord-sent-${{ github.repository }}-${{ steps.datahash.outputs.hash }}
+
+      - name: 중복 알림 판단
+        id: dedupe
+        env:
+          CACHE_HIT: ${{ steps.dedupe-cache.outputs.cache-hit }}
+          FORCE_NOTIFY: ${{ github.event.inputs.force_notify }}
+        run: |
+          set -euo pipefail
+          if [ "$FORCE_NOTIFY" = "true" ]; then
+            echo "send=true" >> "$GITHUB_OUTPUT"
+            echo "강제 전송 요청: 중복 검사를 건너뜁니다."
+          elif [ "$CACHE_HIT" = "true" ]; then
+            echo "send=false" >> "$GITHUB_OUTPUT"
+            echo "동일한 JSON이 이미 전송되었습니다. 중복 알림을 보내지 않습니다."
+          else
+            echo "send=true" >> "$GITHUB_OUTPUT"
+            echo "새 데이터입니다. Discord 알림을 보냅니다."
+          fi
+
+      - name: Discord Webhook 전송
+        id: notify
+        if: steps.dedupe.outputs.send == 'true'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DISCORD_WEBHOOK_URL:-}" ]; then
+            echo "::error::Repository Secrets에 DISCORD_WEBHOOK_URL이 없습니다. Settings > Secrets and variables > Actions에서 등록하세요. (값은 출력하지 않습니다)"
+            exit 1
+          fi
+          echo "웹훅 설정 확인 완료 (값은 출력하지 않습니다)"
+          python discord_bot.py
+
+      - name: 전송 해시 기록
+        if: always() && steps.dedupe.outputs.send == 'true' && steps.notify.outcome == 'success' && steps.dedupe-cache.outputs.cache-hit != 'true'
+        run: echo "${{ steps.datahash.outputs.hash }}" > .lck_last_sent_hash
+
+      - name: 전송 해시 캐시 저장
+        if: always() && steps.dedupe.outputs.send == 'true' && steps.notify.outcome == 'success' && steps.dedupe-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .lck_last_sent_hash
+          key: lck-discord-sent-${{ github.repository }}-${{ steps.datahash.outputs.hash }}
+
+      - name: 실행 요약(GITHUB_STEP_SUMMARY)
+        if: always()
+        env:
+          MODE: ${{ steps.guard.outputs.mode }}
+          HASH: ${{ steps.datahash.outputs.hash }}
+          SEND: ${{ steps.dedupe.outputs.send }}
+          NOTIFY_OUTCOME: ${{ steps.notify.outcome }}
+        run: |
+          {
+            echo "### LCK 자동화 실행 요약"
+            echo "- 실행 모드: ${MODE:-확인 실패}"
+            echo "- 데이터 해시(앞 12자리): ${HASH:0:12}"
+            echo "- Discord 전송 대상: ${SEND:-판단 안 됨}"
+            echo "- Discord 단계 결과: ${NOTIFY_OUTCOME:-실행 안 함}"
+          } >> "$GITHUB_STEP_SUMMARY"

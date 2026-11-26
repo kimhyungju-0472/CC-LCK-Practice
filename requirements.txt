@@ -1,0 +1,6 @@
+# LCK 경기 결과 수집기에 필요한 라이브러리
+# 설치: pip install -r requirements.txt
+# (Google Colab에는 기본적으로 들어 있지만, 설치 셀에서 다시 확인합니다.)
+
+requests>=2.31.0        # API 요청 보내기 + Discord Webhook 전송(별도 Discord 라이브러리 불필요)
+beautifulsoup4>=4.12.0  # API가 준 HTML에서 경기 결과 읽기

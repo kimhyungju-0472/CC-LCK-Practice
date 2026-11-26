@@ -221,3 +221,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# LCK 수집기 API 캐시 (실행 시 자동 생성)
+lck_cache/
